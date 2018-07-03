@@ -4,7 +4,6 @@ import (
 	"sync"
 
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/discv5"
 )
 
@@ -22,8 +21,8 @@ func NewRegister(topics ...discv5.Topic) *Register {
 }
 
 // Start topic register query for every topic
-func (r *Register) Start(server *p2p.Server) error {
-	if server.DiscV5 == nil {
+func (r *Register) Start(discovery Discovery) error {
+	if !discovery.Running() {
 		return ErrDiscv5NotRunning
 	}
 	r.quit = make(chan struct{})
@@ -31,7 +30,7 @@ func (r *Register) Start(server *p2p.Server) error {
 		r.wg.Add(1)
 		go func(t discv5.Topic) {
 			log.Debug("v5 register topic", "topic", t)
-			server.DiscV5.RegisterTopic(t, r.quit)
+			discovery.Register(string(t), r.quit)
 			r.wg.Done()
 		}(topic)
 	}

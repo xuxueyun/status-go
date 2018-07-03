@@ -107,8 +107,8 @@ func (p *PeerPool) setDiscoveryTimeout() {
 }
 
 // Start creates topic pool for each topic in config and subscribes to server events.
-func (p *PeerPool) Start(server *p2p.Server) error {
-	if server.DiscV5 == nil {
+func (p *PeerPool) Start(server *p2p.Server, discovery Discovery) error {
+	if !discovery.Running() {
 		return ErrDiscv5NotRunning
 	}
 
@@ -124,7 +124,7 @@ func (p *PeerPool) Start(server *p2p.Server) error {
 	p.serverSubscription = server.SubscribeEvents(p.events)
 	p.wg.Add(1)
 	go func() {
-		p.handleServerPeers(server, p.events)
+		p.handleServerPeers(server, discovery, p.events)
 		p.wg.Done()
 	}()
 
@@ -132,7 +132,7 @@ func (p *PeerPool) Start(server *p2p.Server) error {
 	p.topics = make([]*TopicPool, 0, len(p.config))
 	for topic, limits := range p.config {
 		topicPool := NewTopicPool(topic, limits, p.opts.SlowSync, p.opts.FastSync, p.cache)
-		if err := topicPool.StartSearch(server); err != nil {
+		if err := topicPool.StartSearch(server, discovery); err != nil {
 			return err
 		}
 		p.topics = append(p.topics, topicPool)
@@ -144,18 +144,16 @@ func (p *PeerPool) Start(server *p2p.Server) error {
 	return nil
 }
 
-func (p *PeerPool) startDiscovery(server *p2p.Server) error {
-	if server.DiscV5 != nil {
+func (p *PeerPool) startDiscovery(discovery Discovery) error {
+	if discovery.Running() {
 		return nil
 	}
 
-	ntab, err := StartDiscv5(server)
-	if err != nil {
+	if err := discovery.Start(); err != nil {
 		return err
 	}
 
 	p.mu.Lock()
-	server.DiscV5 = ntab
 	p.setDiscoveryTimeout()
 	p.mu.Unlock()
 
@@ -164,18 +162,19 @@ func (p *PeerPool) startDiscovery(server *p2p.Server) error {
 	return nil
 }
 
-func (p *PeerPool) stopDiscovery(server *p2p.Server) {
-	if server.DiscV5 == nil {
+func (p *PeerPool) stopDiscovery(discovery Discovery) {
+	if !discovery.Running() {
 		return
 	}
 
 	for _, t := range p.topics {
 		t.StopSearch()
 	}
+	if err := discovery.Stop(); err != nil {
+		log.Debug("discovery erred when was closed", "err", err)
+	}
 
 	p.mu.Lock()
-	server.DiscV5.Close()
-	server.DiscV5 = nil
 	p.timeout = nil
 	p.mu.Unlock()
 
@@ -183,9 +182,9 @@ func (p *PeerPool) stopDiscovery(server *p2p.Server) {
 }
 
 // restartDiscovery and search for topics that have peer count below min
-func (p *PeerPool) restartDiscovery(server *p2p.Server) error {
-	if server.DiscV5 == nil {
-		if err := p.startDiscovery(server); err != nil {
+func (p *PeerPool) restartDiscovery(server *p2p.Server, discovery Discovery) error {
+	if !discovery.Running() {
+		if err := p.startDiscovery(discovery); err != nil {
 			return err
 		}
 		log.Debug("restarted discovery from peer pool")
@@ -194,7 +193,7 @@ func (p *PeerPool) restartDiscovery(server *p2p.Server) error {
 		if !t.BelowMin() || t.SearchRunning() {
 			continue
 		}
-		err := t.StartSearch(server)
+		err := t.StartSearch(server, discovery)
 		if err != nil {
 			log.Error("search failed to start", "error", err)
 		}
@@ -207,7 +206,7 @@ func (p *PeerPool) restartDiscovery(server *p2p.Server) error {
 //
 // @TODO(adam): split it into peers and discovery management loops. This should
 // simplify the whole logic and allow to remove `timeout` field from `PeerPool`.
-func (p *PeerPool) handleServerPeers(server *p2p.Server, events <-chan *p2p.PeerEvent) {
+func (p *PeerPool) handleServerPeers(server *p2p.Server, discovery Discovery, events <-chan *p2p.PeerEvent) {
 	var retryDiscv5 <-chan time.Time
 	var stopDiscv5 <-chan time.Time
 
@@ -218,19 +217,19 @@ func (p *PeerPool) handleServerPeers(server *p2p.Server, events <-chan *p2p.Peer
 
 		select {
 		case <-p.quit:
-			log.Debug("stopping DiscV5 because of quit", "server", server.Self())
-			p.stopDiscovery(server)
+			log.Debug("stopping DiscV5 because of quit")
+			p.stopDiscovery(discovery)
 			return
 		case <-timeout:
-			log.Info("DiscV5 timed out", "server", server.Self())
-			p.stopDiscovery(server)
+			log.Info("DiscV5 timed out")
+			p.stopDiscovery(discovery)
 		case <-retryDiscv5:
-			if err := p.restartDiscovery(server); err != nil {
+			if err := p.restartDiscovery(server, discovery); err != nil {
 				retryDiscv5 = time.After(discoveryRestartTimeout)
 				log.Error("starting discv5 failed", "error", err, "retry", discoveryRestartTimeout)
 			}
 		case <-stopDiscv5:
-			p.handleStopTopics(server)
+			p.handleStopTopics(discovery)
 		case event := <-events:
 			switch event.Type {
 			case p2p.PeerEventTypeDrop:
@@ -265,7 +264,7 @@ func (p *PeerPool) handleAddedPeer(server *p2p.Server, nodeID discover.NodeID) {
 // handleStopTopics stops the search on any topics having reached its max cached
 // limit or its delay stop is expired, additionally will stop discovery if all
 // peers are stopped.
-func (p *PeerPool) handleStopTopics(server *p2p.Server) {
+func (p *PeerPool) handleStopTopics(discovery Discovery) {
 	if !p.opts.AllowStop {
 		return
 	}
@@ -275,8 +274,8 @@ func (p *PeerPool) handleStopTopics(server *p2p.Server) {
 		}
 	}
 	if p.allTopicsStopped() {
-		log.Debug("closing discv5 connection because all topics reached max limit", "server", server.Self())
-		p.stopDiscovery(server)
+		log.Debug("closing discv5 connection because all topics reached max limit")
+		p.stopDiscovery(discovery)
 	}
 }
 

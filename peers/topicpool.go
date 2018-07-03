@@ -347,11 +347,11 @@ func (t *TopicPool) AddPeerFromTable(server *p2p.Server) *discv5.Node {
 }
 
 // StartSearch creates discv5 queries and runs a loop to consume found peers.
-func (t *TopicPool) StartSearch(server *p2p.Server) error {
+func (t *TopicPool) StartSearch(server *p2p.Server, discovery Discovery) error {
 	if atomic.LoadInt32(&t.running) == 1 {
 		return nil
 	}
-	if server.DiscV5 == nil {
+	if !discovery.Running() {
 		return ErrDiscv5NotRunning
 	}
 	atomic.StoreInt32(&t.running, 1)
@@ -378,7 +378,9 @@ func (t *TopicPool) StartSearch(server *p2p.Server) error {
 
 	t.discWG.Add(1)
 	go func() {
-		server.DiscV5.SearchTopic(t.topic, t.period, found, lookup)
+		if err := discovery.Discover(string(t.topic), t.period, found, lookup); err != nil {
+			log.Error("error searching foro", "topic", t.topic, "err", err)
+		}
 		t.discWG.Done()
 	}()
 	t.poolWG.Add(1)

@@ -27,9 +27,10 @@ import (
 type PeerPoolSimulationSuite struct {
 	suite.Suite
 
-	bootnode *p2p.Server
-	peers    []*p2p.Server
-	port     uint16
+	bootnode  *p2p.Server
+	peers     []*p2p.Server
+	discovery []Discovery
+	port      uint16
 }
 
 func TestPeerPoolSimulationSuite(t *testing.T) {
@@ -63,6 +64,7 @@ func (s *PeerPoolSimulationSuite) SetupTest() {
 
 	// 1 peer to initiate connection, 1 peer as a first candidate, 1 peer - for failover
 	s.peers = make([]*p2p.Server, 3)
+	s.discovery = make([]Discovery, 3)
 	for i := range s.peers {
 		key, _ := crypto.GenerateKey()
 		whisper := whisperv6.New(nil)
@@ -72,7 +74,6 @@ func (s *PeerPoolSimulationSuite) SetupTest() {
 				Name:             common.MakeName("peer-"+strconv.Itoa(i), "1.0"),
 				ListenAddr:       fmt.Sprintf("0.0.0.0:%d", s.nextPort()),
 				PrivateKey:       key,
-				DiscoveryV5:      true,
 				NoDiscovery:      true,
 				BootstrapNodesV5: []*discv5.Node{bootnodeV5},
 				Protocols:        whisper.Protocols(),
@@ -80,13 +81,17 @@ func (s *PeerPoolSimulationSuite) SetupTest() {
 		}
 		s.NoError(peer.Start())
 		s.peers[i] = peer
+		d := NewDiscV5(key, peer.ListenAddr, peer.BootstrapNodesV5)
+		s.NoError(d.Start())
+		s.discovery[i] = d
 	}
 }
 
 func (s *PeerPoolSimulationSuite) TearDown() {
 	s.bootnode.Stop()
-	for _, p := range s.peers {
-		p.Stop()
+	for i := range s.peers {
+		s.peers[i].Stop()
+		s.NoError(s.discovery[i].Stop())
 	}
 }
 
@@ -127,7 +132,7 @@ func (s *PeerPoolSimulationSuite) TestPeerPoolCache() {
 	peerPool := NewPeerPool(config, cache, peerPoolOpts)
 
 	// start peer pool
-	s.Require().NoError(peerPool.Start(s.peers[1]))
+	s.Require().NoError(peerPool.Start(s.peers[1], s.discovery[1]))
 	defer peerPool.Stop()
 
 	// check if cache is passed to topic pools
@@ -177,7 +182,7 @@ func (s *PeerPoolSimulationSuite) TestSingleTopicDiscoveryWithFailover() {
 
 	// create and start topic registry
 	register := NewRegister(topic)
-	err = register.Start(s.peers[0])
+	err = register.Start(s.discovery[0])
 	s.Require().NoError(err)
 
 	// subscribe for peer events before starting the peer pool
@@ -186,7 +191,7 @@ func (s *PeerPoolSimulationSuite) TestSingleTopicDiscoveryWithFailover() {
 	defer subscription.Unsubscribe()
 
 	// start the peer pool
-	s.Require().NoError(peerPool.Start(s.peers[1]))
+	s.Require().NoError(peerPool.Start(s.peers[1], s.discovery[1]))
 	defer peerPool.Stop()
 	s.Equal(signal.EventDiscoveryStarted, s.getPoolEvent(poolEvents))
 
@@ -210,7 +215,7 @@ func (s *PeerPoolSimulationSuite) TestSingleTopicDiscoveryWithFailover() {
 	s.Equal(signal.EventDiscoveryStarted, s.getPoolEvent(poolEvents))
 
 	// register the second peer
-	err = register.Start(s.peers[2])
+	err = register.Start(s.discovery[2])
 	s.Require().NoError(err)
 	defer register.Stop()
 	s.Equal(s.peers[2].Self().ID, s.getPeerFromEvent(events, p2p.PeerEventTypeAdd))
@@ -243,23 +248,25 @@ func TestPeerPoolMaxPeersOverflow(t *testing.T) {
 	peer := &p2p.Server{
 		Config: p2p.Config{
 			PrivateKey:  key,
-			DiscoveryV5: true,
 			NoDiscovery: true,
 		},
 	}
 	require.NoError(t, peer.Start())
 	defer peer.Stop()
-	require.NotNil(t, peer.DiscV5)
+	discovery := NewDiscV5(key, peer.ListenAddr, nil)
+	require.NoError(t, discovery.Start())
+	defer func() { _ = discovery.Stop() }()
+	require.True(t, discovery.Running())
 
 	poolOpts := &Options{DefaultFastSync, DefaultSlowSync, 0, true, 100 * time.Millisecond}
 	pool := NewPeerPool(nil, nil, poolOpts)
-	require.NoError(t, pool.Start(peer))
+	require.NoError(t, pool.Start(peer, discovery))
 	require.Equal(t, signal.EventDiscoveryStarted, <-signals)
 	// without config, it will stop the discovery because all topic pools are satisfied
 	pool.events <- &p2p.PeerEvent{Type: p2p.PeerEventTypeAdd}
 	require.Equal(t, signal.EventDiscoverySummary, <-signals)
 	require.Equal(t, signal.EventDiscoveryStopped, <-signals)
-	require.Nil(t, peer.DiscV5)
+	require.False(t, discovery.Running())
 	// another peer added after discovery is stopped should not panic
 	pool.events <- &p2p.PeerEvent{Type: p2p.PeerEventTypeAdd}
 }
@@ -292,18 +299,21 @@ func TestPeerPoolDiscV5Timeout(t *testing.T) {
 	server := &p2p.Server{
 		Config: p2p.Config{
 			PrivateKey:  key,
-			DiscoveryV5: true,
 			NoDiscovery: true,
 		},
 	}
 	require.NoError(t, server.Start())
 	defer server.Stop()
-	require.NotNil(t, server.DiscV5)
+
+	discovery := NewDiscV5(key, server.ListenAddr, nil)
+	require.NoError(t, discovery.Start())
+	defer func() { _ = discovery.Stop() }()
+	require.True(t, discovery.Running())
 
 	// start PeerPool
 	poolOpts := &Options{DefaultFastSync, DefaultSlowSync, time.Millisecond * 100, true, 100 * time.Millisecond}
 	pool := NewPeerPool(nil, nil, poolOpts)
-	require.NoError(t, pool.Start(server))
+	require.NoError(t, pool.Start(server, discovery))
 	require.Equal(t, signal.EventDiscoveryStarted, <-signals)
 
 	// timeout after finding no peers
@@ -313,12 +323,12 @@ func TestPeerPoolDiscV5Timeout(t *testing.T) {
 	case <-time.After(pool.opts.DiscServerTimeout * 2):
 		t.Fatal("timed out")
 	}
-	require.Nil(t, server.DiscV5)
+	require.False(t, discovery.Running())
 
 	// timeout after discovery restart
-	require.NoError(t, pool.restartDiscovery(server))
+	require.NoError(t, pool.restartDiscovery(server, discovery))
 	require.Equal(t, signal.EventDiscoveryStarted, <-signals)
-	require.NotNil(t, server.DiscV5)
+	require.True(t, discovery.Running())
 	pool.events <- &p2p.PeerEvent{Type: p2p.PeerEventTypeDrop} // required to turn the loop and pick up new timeout
 	select {
 	case sig := <-signals:
@@ -326,7 +336,7 @@ func TestPeerPoolDiscV5Timeout(t *testing.T) {
 	case <-time.After(pool.opts.DiscServerTimeout * 2):
 		t.Fatal("timed out")
 	}
-	require.Nil(t, server.DiscV5)
+	require.False(t, discovery.Running())
 }
 
 func TestPeerPoolNotAllowedStopping(t *testing.T) {
@@ -336,20 +346,23 @@ func TestPeerPoolNotAllowedStopping(t *testing.T) {
 	server := &p2p.Server{
 		Config: p2p.Config{
 			PrivateKey:  key,
-			DiscoveryV5: true,
 			NoDiscovery: true,
 		},
 	}
 	require.NoError(t, server.Start())
 	defer server.Stop()
-	require.NotNil(t, server.DiscV5)
+
+	discovery := NewDiscV5(key, server.ListenAddr, nil)
+	require.NoError(t, discovery.Start())
+	defer func() { _ = discovery.Stop() }()
+	require.True(t, discovery.Running())
 
 	// start PeerPool
 	poolOpts := &Options{DefaultFastSync, DefaultSlowSync, time.Millisecond * 100, false, 100 * time.Millisecond}
 	pool := NewPeerPool(nil, nil, poolOpts)
-	require.NoError(t, pool.Start(server))
+	require.NoError(t, pool.Start(server, discovery))
 
 	// wait 2x timeout duration
 	<-time.After(pool.opts.DiscServerTimeout * 2)
-	require.NotNil(t, server.DiscV5)
+	require.True(t, discovery.Running())
 }
